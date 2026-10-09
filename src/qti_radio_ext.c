@@ -97,6 +97,7 @@ enum qti_radio_ext_signal {
     SIGNAL_EXT_ON_INCOMING_SMS_REPORT,
     SIGNAL_EXT_ON_VOICE_DISABLED,
     SIGNAL_EXT_HANDOVER,
+    SIGNAL_EXT_ON_RINGBACK_TONE,
     SIGNAL_COUNT
 };
 
@@ -107,6 +108,7 @@ enum qti_radio_ext_signal {
 #define SIGNAL_EXT_ON_INCOMING_SMS_REPORT_NAME      "qti-radio-ext-on-incoming-sms-report"
 #define SIGNAL_EXT_ON_VOICE_DISABLED_NAME           "qti-radio-ext-on-voice-disabled"
 #define SIGNAL_EXT_HANDOVER_NAME                    "qti-radio-ext-handover"
+#define SIGNAL_EXT_ON_RINGBACK_TONE_NAME            "qti-radio-ext-on-ringback-tone"
 
 static guint qti_radio_ext_signals[SIGNAL_COUNT] = { 0 };
 
@@ -826,6 +828,43 @@ qti_radio_ext_handle_handover_indication(
 }
 
 static
+const char*
+qti_radio_tone_operation_name(
+    gint32 op)
+{
+    switch (op) {
+    case QTI_RADIO_TONE_OPERATION_INVALID: return "INVALID";
+    case QTI_RADIO_TONE_OPERATION_STOP:    return "STOP";
+    case QTI_RADIO_TONE_OPERATION_START:   return "START";
+    default:                               return "?";
+    }
+}
+
+static
+void
+qti_radio_ext_handle_ringback_tone_indication(
+    QtiRadioExt* self,
+    const GBinderReader* args)
+{
+    /* oneway onRingbackTone(in ToneOperation tone), ToneOperation is int */
+    GBinderReader reader;
+    gint32 op;
+
+    gbinder_reader_copy(&reader, args);
+    if (gbinder_reader_read_int32(&reader, &op)) {
+        /* Like ims.apk: START plays the local tone, anything else stops it */
+        const gboolean start = (op == QTI_RADIO_TONE_OPERATION_START);
+
+        DBG("%s: RingbackTone: %s (%d) -> %s", self->slot,
+            qti_radio_tone_operation_name(op), op, start ? "start" : "stop");
+        g_signal_emit(self, qti_radio_ext_signals[SIGNAL_EXT_ON_RINGBACK_TONE],
+            0, start);
+    } else {
+        DBG("%s: failed to parse ringback tone data", self->slot);
+    }
+}
+
+static
 void
 qti_radio_ext_handle_vops_indication(
     QtiRadioExt* self,
@@ -1002,6 +1041,9 @@ qti_radio_ext_indication(
         case QTI_RADIO_IND_RING_INDICATION:
             g_signal_emit(self, qti_radio_ext_signals[SIGNAL_EXT_ON_RING], 0);
             return NULL;
+        case QTI_RADIO_IND_RINGBACK_TONE_INDICATION:
+            qti_radio_ext_handle_ringback_tone_indication(self, &args);
+            return NULL;
         case QTI_RADIO_IND_REG_STATE_INDICATION:
             qti_radio_ext_handle_ims_reg_status_report(self, &args);
             return NULL;
@@ -1066,6 +1108,16 @@ qti_radio_ext_add_ring_handler(
 {
     return (G_LIKELY(self) && G_LIKELY(handler)) ? g_signal_connect(self,
         SIGNAL_EXT_ON_RING_NAME, G_CALLBACK(handler), user_data) : 0;
+}
+
+gulong
+qti_radio_ext_add_ringback_tone_handler(
+    QtiRadioExt* self,
+    QtiRadioExtRingbackToneFunc handler,
+    void* user_data)
+{
+    return (G_LIKELY(self) && G_LIKELY(handler)) ? g_signal_connect(self,
+        SIGNAL_EXT_ON_RINGBACK_TONE_NAME, G_CALLBACK(handler), user_data) : 0;
 }
 
 gulong
@@ -2058,6 +2110,10 @@ qti_radio_ext_class_init(
         g_signal_new(SIGNAL_EXT_HANDOVER_NAME, G_OBJECT_CLASS_TYPE(klass),
             G_SIGNAL_RUN_FIRST, 0, NULL, NULL, NULL, G_TYPE_NONE,
             3, G_TYPE_INT, G_TYPE_INT, G_TYPE_INT);
+    qti_radio_ext_signals[SIGNAL_EXT_ON_RINGBACK_TONE] =
+        g_signal_new(SIGNAL_EXT_ON_RINGBACK_TONE_NAME, G_OBJECT_CLASS_TYPE(klass),
+            G_SIGNAL_RUN_FIRST, 0, NULL, NULL, NULL, G_TYPE_NONE,
+            1, G_TYPE_BOOLEAN);
 }
 
 /*

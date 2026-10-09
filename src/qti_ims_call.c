@@ -42,6 +42,7 @@ typedef struct qti_ims_call {
     QtiRadioExt* radio_ext;
     GPtrArray* calls;
     GHashTable* id_map;
+    gboolean ringback_tone; /* last value passed to oFono */
 } QtiImsCall;
 
 static
@@ -87,6 +88,7 @@ enum qti_ims_call_signal {
     SIGNAL_CALL_END,
     SIGNAL_CALL_RING,
     SIGNAL_CALL_SUPP_SVC_NOTIFY,
+    SIGNAL_CALL_RINGBACK_TONE,
     SIGNAL_COUNT
 };
 
@@ -94,6 +96,7 @@ enum qti_ims_call_signal {
 #define SIGNAL_CALL_END_NAME              "qti-ims-call-end"
 #define SIGNAL_CALL_RING_NAME             "qti-ims-call-ring"
 #define SIGNAL_CALL_SUPP_SVC_NOTIFY_NAME  "qti-ims-call-supp-svc-notify"
+#define SIGNAL_CALL_RINGBACK_TONE_NAME    "qti-ims-call-ringback-tone"
 
 static guint qti_ims_call_signals[SIGNAL_COUNT] = { 0 };
 
@@ -246,12 +249,63 @@ qti_ims_call_id_find_by_state(
 
 static
 void
+qti_ims_call_set_ringback_tone(
+    QtiImsCall* self,
+    gboolean start)
+{
+    self->ringback_tone = start;
+    g_signal_emit(self, qti_ims_call_signals[SIGNAL_CALL_RINGBACK_TONE], 0,
+        start);
+}
+
+static
+gboolean
+qti_ims_call_state_is_setup(
+    BINDER_EXT_CALL_STATE state)
+{
+    return state == BINDER_EXT_CALL_STATE_DIALING ||
+        state == BINDER_EXT_CALL_STATE_ALERTING;
+}
+
+static
+void
+qti_ims_call_handle_ringback_tone(
+    QtiRadioExt* radio,
+    gboolean start,
+    void* user_data)
+{
+    qti_ims_call_set_ringback_tone(THIS(user_data), start);
+}
+
+static
+void
 qti_ims_call_handle_call_info(
     QtiRadioExt* radio,
     GPtrArray* updated_calls,
     void* user_data)
 {
     QtiImsCall* self = THIS(user_data);
+
+    // The modem sends onRingbackTone(STOP) before ACTIVE or END. If it ever
+    // does not, stop the local tone when the outgoing call leaves
+    // DIALING/ALERTING, otherwise telepathy-ring keeps "alert-tone-needed"
+    // set for the next call. This runs before the END handling below, so
+    // the stop reaches telepathy-ring while it still knows the call.
+    if (self->ringback_tone) {
+        for (int i = 0; i < updated_calls->len; i++) {
+            QtiRadioCallInfo* info = g_ptr_array_index(updated_calls, i);
+            BinderExtCallInfo* call = qti_ims_call_info_find(self, info->index);
+
+            if (call && qti_ims_call_state_is_setup(call->state) &&
+                !qti_ims_call_state_is_setup(
+                    qti_radio_ims_call_radio_state_to_state(info->state))) {
+                DBG("call %d left call setup without ringback STOP, "
+                    "stopping the ringback tone", info->index);
+                qti_ims_call_set_ringback_tone(self, FALSE);
+                break;
+            }
+        }
+    }
 
     // loop over the updated calls
     for (int i = 0; i < updated_calls->len; i++) {
@@ -290,6 +344,11 @@ qti_ims_call_handle_voice_disabled(
     DBG("Remove the list of calls as voice is disabled");
 
     QtiImsCall* self = THIS(user_data);
+    if (self->ringback_tone) {
+        /* The calls are dropped without END, so the safety net in
+         * qti_ims_call_handle_call_info would never see them leave setup */
+        qti_ims_call_set_ringback_tone(self, FALSE);
+    }
     if (self->calls) {
         g_ptr_array_remove_range(self->calls, 0, self->calls->len);
     }
@@ -793,6 +852,17 @@ qti_ims_call_add_ssn_handler(
         SIGNAL_CALL_SUPP_SVC_NOTIFY_NAME, G_CALLBACK(cb), user_data) : 0;
 }
 
+static
+gulong
+qti_ims_call_add_ringback_tone_handler(
+    BinderExtCall* ext,
+    BinderExtCallRingbackToneFunc cb,
+    void* user_data)
+{
+    return G_LIKELY(cb) ? g_signal_connect(THIS(ext),
+        SIGNAL_CALL_RINGBACK_TONE_NAME, G_CALLBACK(cb), user_data) : 0;
+}
+
 void
 qti_ims_call_iface_init(
     BinderExtCallInterface* iface)
@@ -813,6 +883,7 @@ qti_ims_call_iface_init(
     iface->add_disconnect_handler = qti_ims_call_add_disconnect_handler;
     iface->add_ring_handler = qti_ims_call_add_ring_handler;
     iface->add_ssn_handler = qti_ims_call_add_ssn_handler;
+    iface->add_ringback_tone_handler = qti_ims_call_add_ringback_tone_handler;
 }
 
 /*==========================================================================*
@@ -833,6 +904,8 @@ qti_ims_call_new(
             qti_ims_call_handle_call_info, self);
         qti_radio_ext_add_ring_handler(radio_ext,
             qti_ims_call_handle_ring, self);
+        qti_radio_ext_add_ringback_tone_handler(radio_ext,
+            qti_ims_call_handle_ringback_tone, self);
         qti_radio_ext_add_voice_disabled_handler(radio_ext,
             qti_ims_call_handle_voice_disabled, self);
         qti_radio_ext_add_handover_handler(radio_ext,
@@ -892,6 +965,10 @@ qti_ims_call_class_init(
         g_signal_new(SIGNAL_CALL_SUPP_SVC_NOTIFY_NAME, type,
             G_SIGNAL_RUN_FIRST, 0, NULL, NULL, NULL, G_TYPE_NONE,
             1, G_TYPE_POINTER);
+    qti_ims_call_signals[SIGNAL_CALL_RINGBACK_TONE] =
+        g_signal_new(SIGNAL_CALL_RINGBACK_TONE_NAME, type,
+            G_SIGNAL_RUN_FIRST, 0, NULL, NULL, NULL, G_TYPE_NONE,
+            1, G_TYPE_BOOLEAN);
 }
 
 /*

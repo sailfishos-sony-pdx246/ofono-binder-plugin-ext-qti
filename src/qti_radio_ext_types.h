@@ -188,6 +188,19 @@ typedef enum qti_radio_handover_type {
     QTI_RADIO_HANDOVER_NOT_TRIGGERED_MOBILE_DATA_OFF = 6,
 } QTI_RADIO_HANDOVER_TYPE;
 
+/*
+ * vendor.qti.hardware.radio.ims ToneOperation (AIDL), the argument of
+ * IImsRadioIndication.onRingbackTone. The AIDL values differ from
+ * HIDL @1.0 (STOP = 0, START = 1, INVALID = 2): AIDL put INVALID first.
+ * Qualcomm's own client (ims.apk, StableAidl.toRingbackTone) plays the
+ * tone only for START = 2.
+ */
+typedef enum qti_radio_tone_operation {
+    QTI_RADIO_TONE_OPERATION_INVALID = 0,
+    QTI_RADIO_TONE_OPERATION_STOP    = 1,
+    QTI_RADIO_TONE_OPERATION_START   = 2,
+} QTI_RADIO_TONE_OPERATION;
+
 typedef enum qti_radio_ims_sms_send_status_result {
     QTI_RADIO_SEND_STATUS_OK = 1,
     QTI_RADIO_SEND_STATUS_ERROR = 2,

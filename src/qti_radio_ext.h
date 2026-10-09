@@ -47,6 +47,11 @@ typedef void (*QtiRadioExtRingFunc)(
     QtiRadioExt* radio,
     void* user_data);
 
+typedef void (*QtiRadioExtRingbackToneFunc)(
+    QtiRadioExt* radio,
+    gboolean start,
+    void* user_data);
+
 typedef void (*QtiRadioExtIncomingSmsFunc)(
     QtiRadioExt* radio,
     const void* pdu,
@@ -187,6 +192,12 @@ gulong
 qti_radio_ext_add_ring_handler(
     QtiRadioExt* self,
     QtiRadioExtRingFunc handler,
+    void* user_data);
+
+gulong
+qti_radio_ext_add_ringback_tone_handler(
+    QtiRadioExt* self,
+    QtiRadioExtRingbackToneFunc handler,
     void* user_data);
 
 gulong
