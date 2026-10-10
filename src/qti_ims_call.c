@@ -585,8 +585,11 @@ qti_ims_call_handle_call_info(
                 continue;
             }
 
+          // The signal takes (int call_id, int reason); it used to get "" as
+          // the reason. ofono-binder-plugin reports anything but ERROR for a
+          // call it did not hang up itself as a remote hangup.
           g_signal_emit(THIS(user_data), qti_ims_call_signals[SIGNAL_CALL_END],
-                        0, call_id, "");
+                        0, call_id, BINDER_EXT_CALL_DISCONNECT_UNKNOWN);
 
           if (call)
             g_ptr_array_remove(self->calls, call);
@@ -873,6 +876,18 @@ qti_ims_call_hangup(
     void* user_data)
 {
     QtiImsCall* self = THIS(ext);
+
+    // ofono-binder-plugin up to 1.1.25 passes reason and flags swapped
+    // (fixed upstream by 3e79f62a, "binder_voicecall: fix
+    // binder_ext_call_hangup argument order"). HANGUP_FLAGS has only
+    // NO_FLAGS (0), so a non-zero flags value is the reason; this does
+    // nothing once a fixed ofono-binder-plugin is installed.
+    if (reason == BINDER_EXT_CALL_HANGUP_TERMINATE &&
+        ((int)flags == BINDER_EXT_CALL_HANGUP_IGNORE ||
+         (int)flags == BINDER_EXT_CALL_HANGUP_REJECT)) {
+        reason = (BINDER_EXT_CALL_HANGUP_REASON)flags;
+        flags = BINDER_EXT_CALL_HANGUP_NO_FLAGS;
+    }
 
     // Hanging up a member ends the whole conference (no per-participant
     // hangup without the participant URIs from onRefreshConferenceInfo)
