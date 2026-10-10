@@ -1885,6 +1885,28 @@ qti_radio_ext_resume(
         call_id);
 }
 
+/*
+ * IImsRadio V12 conference(int token) = 14, answered by
+ * conferenceResponse(int token, ErrorCode, SipErrorInfo) = 13
+ * (vendor.qti.hardware.radio.ims-V12-ndk_platform.so BpImsRadio::conference,
+ * BpImsRadioResponse::conferenceResponse; ims.apk TRANSACTION_conference).
+ * The modem merges its ACTIVE and HOLDING calls; there are no arguments
+ * besides the token, which qti_radio_ext_result_request_submit writes.
+ */
+guint
+qti_radio_ext_conference(
+    QtiRadioExt* self,
+    QtiRadioExtResultFunc complete,
+    GDestroyNotify destroy,
+    void* user_data)
+{
+    return qti_radio_ext_result_request_submit(self,
+        QTI_RADIO_REQ_CONFERENCE,
+        QTI_RADIO_RESP_CONFERENCE,
+        NULL,
+        complete, destroy, user_data);
+}
+
 static
 void
 qti_radio_ext_send_ims_sms_args(

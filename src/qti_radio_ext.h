@@ -158,6 +158,13 @@ qti_radio_ext_resume(
     void* user_data);
 
 guint
+qti_radio_ext_conference(
+    QtiRadioExt* self,
+    QtiRadioExtResultFunc complete,
+    GDestroyNotify destroy,
+    void* user_data);
+
+guint
 qti_radio_ext_send_ims_sms(
     QtiRadioExt* self,
     const char* smsc,

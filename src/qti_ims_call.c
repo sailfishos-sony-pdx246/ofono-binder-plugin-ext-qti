@@ -43,6 +43,18 @@ typedef struct qti_ims_call {
     GPtrArray* calls;
     GHashTable* id_map;
     gboolean ringback_tone; /* last value passed to oFono */
+    /*
+     * IMS conference. The modem merges its ACTIVE and HOLDING call into
+     * a new isMpty call and ends the merged calls. oFono models a
+     * conference as several calls in its multiparty list, so the merged
+     * calls stay in self->calls as members that follow the state of the
+     * isMpty call. A new isMpty call is flagged BINDER_EXT_CALL_FLAG_MPTY,
+     * which ofono-binder-plugin does not report to the oFono core.
+     */
+    guint conf_call_id;       /* modem id of the isMpty call, 0 if none */
+    GHashTable* conf_members; /* call id -> CONF_MEMBER_LIVE/GONE */
+    GHashTable* conf_pending; /* the same, while a merge is in progress */
+    guint conf_check_id;      /* timeout source */
 } QtiImsCall;
 
 static
@@ -60,6 +72,10 @@ G_IMPLEMENT_INTERFACE(BINDER_EXT_TYPE_CALL, qti_ims_call_iface_init))
 
 #define ID_KEY(id) GUINT_TO_POINTER(id)
 #define ID_VALUE(id) GUINT_TO_POINTER(id)
+
+#define CONF_MEMBER_LIVE GUINT_TO_POINTER(1) /* the modem still has the call */
+#define CONF_MEMBER_GONE GUINT_TO_POINTER(2) /* merged, kept for oFono */
+#define CONF_CHECK_TIMEOUT_SEC (5)
 
 typedef struct qti_ims_call_result_request {
     int ref_count;
@@ -247,6 +263,234 @@ qti_ims_call_id_find_by_state(
     return 0;
 }
 
+/*==========================================================================*
+ * Conference
+ *==========================================================================*/
+
+static
+void
+qti_ims_call_emit_end(
+    QtiImsCall* self,
+    guint call_id)
+{
+    g_signal_emit(self, qti_ims_call_signals[SIGNAL_CALL_END], 0, call_id,
+        BINDER_EXT_CALL_DISCONNECT_UNKNOWN);
+}
+
+static
+gboolean
+qti_ims_call_conf_merging(
+    QtiImsCall* self)
+{
+    return g_hash_table_size(self->conf_pending) ||
+        g_hash_table_size(self->conf_members);
+}
+
+static
+gboolean
+qti_ims_call_conf_is_member(
+    QtiImsCall* self,
+    guint call_id)
+{
+    return g_hash_table_contains(self->conf_members, ID_KEY(call_id)) ||
+        g_hash_table_contains(self->conf_pending, ID_KEY(call_id));
+}
+
+static
+gboolean
+qti_ims_call_conf_is_gone(
+    QtiImsCall* self,
+    guint call_id)
+{
+    return g_hash_table_lookup(self->conf_members, ID_KEY(call_id)) ==
+        CONF_MEMBER_GONE ||
+        g_hash_table_lookup(self->conf_pending, ID_KEY(call_id)) ==
+        CONF_MEMBER_GONE;
+}
+
+static
+void
+qti_ims_call_conf_mark_gone(
+    QtiImsCall* self,
+    guint call_id)
+{
+    g_hash_table_insert(g_hash_table_contains(self->conf_members,
+        ID_KEY(call_id)) ? self->conf_members : self->conf_pending,
+        ID_KEY(call_id), CONF_MEMBER_GONE);
+}
+
+/* The modem knows a conference only by its isMpty call */
+static
+guint
+qti_ims_call_modem_id(
+    QtiImsCall* self,
+    guint call_id)
+{
+    if (self->conf_call_id && call_id != self->conf_call_id &&
+        g_hash_table_contains(self->conf_members, ID_KEY(call_id))) {
+        DBG("call %u is in conference call %u", call_id, self->conf_call_id);
+        return self->conf_call_id;
+    }
+    return call_id;
+}
+
+/* Ends a call that only oFono still has */
+static
+void
+qti_ims_call_conf_drop(
+    QtiImsCall* self,
+    guint call_id)
+{
+    BinderExtCallInfo* call = qti_ims_call_info_find(self, call_id);
+
+    g_hash_table_remove(self->conf_members, ID_KEY(call_id));
+    g_hash_table_remove(self->conf_pending, ID_KEY(call_id));
+    if (call) {
+        qti_ims_call_emit_end(self, call_id);
+        g_ptr_array_remove(self->calls, call);
+    }
+}
+
+static
+void
+qti_ims_call_conf_drop_gone(
+    QtiImsCall* self,
+    GHashTable* table)
+{
+    GHashTableIter it;
+    gpointer key, value;
+    GSList* gone = NULL;
+    GSList* l;
+
+    g_hash_table_iter_init(&it, table);
+    while (g_hash_table_iter_next(&it, &key, &value)) {
+        if (value == CONF_MEMBER_GONE) {
+            gone = g_slist_prepend(gone, key);
+        }
+    }
+    for (l = gone; l; l = l->next) {
+        DBG("ending merged call %u", GPOINTER_TO_UINT(l->data));
+        qti_ims_call_conf_drop(self, GPOINTER_TO_UINT(l->data));
+    }
+    g_slist_free(gone);
+}
+
+/* Members follow the state of the conference call */
+static
+void
+qti_ims_call_conf_sync(
+    QtiImsCall* self)
+{
+    BinderExtCallInfo* conf = self->conf_call_id ?
+        qti_ims_call_info_find(self, self->conf_call_id) : NULL;
+
+    // The conference call is an MO call to the conference server and may
+    // pass DIALING/ALERTING first; members only take ACTIVE and HOLDING
+    if (conf && (conf->state == BINDER_EXT_CALL_STATE_ACTIVE ||
+        conf->state == BINDER_EXT_CALL_STATE_HOLDING)) {
+        GHashTableIter it;
+        gpointer key;
+
+        g_hash_table_iter_init(&it, self->conf_members);
+        while (g_hash_table_iter_next(&it, &key, NULL)) {
+            BinderExtCallInfo* call =
+                qti_ims_call_info_find(self, GPOINTER_TO_UINT(key));
+
+            if (call) {
+                call->state = conf->state;
+            }
+        }
+    }
+}
+
+static
+void
+qti_ims_call_conf_end(
+    QtiImsCall* self)
+{
+    /* Calls the modem still has get their own END */
+    qti_ims_call_conf_drop_gone(self, self->conf_members);
+    qti_ims_call_conf_drop_gone(self, self->conf_pending);
+    g_hash_table_remove_all(self->conf_members);
+    g_hash_table_remove_all(self->conf_pending);
+    self->conf_call_id = 0;
+}
+
+static
+gboolean
+qti_ims_call_conf_check(
+    gpointer user_data)
+{
+    QtiImsCall* self = THIS(user_data);
+
+    self->conf_check_id = 0;
+    if (!self->conf_call_id && g_hash_table_size(self->conf_members)) {
+        DBG("no conference call after the merge, ending the merged calls");
+        qti_ims_call_conf_end(self);
+        g_signal_emit(self, qti_ims_call_signals[SIGNAL_CALL_STATE_CHANGED], 0);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static
+void
+qti_ims_call_conf_commit(
+    QtiImsCall* self)
+{
+    GHashTableIter it;
+    gpointer key, value;
+
+    g_hash_table_iter_init(&it, self->conf_pending);
+    while (g_hash_table_iter_next(&it, &key, &value)) {
+        g_hash_table_insert(self->conf_members, key, value);
+    }
+    g_hash_table_remove_all(self->conf_pending);
+
+    if (self->conf_call_id) {
+        qti_ims_call_conf_sync(self);
+    } else if (!self->conf_check_id) {
+        /* Normally the isMpty call is already there; don't wait forever */
+        self->conf_check_id = g_timeout_add_seconds(CONF_CHECK_TIMEOUT_SEC,
+            qti_ims_call_conf_check, self);
+    }
+}
+
+static
+void
+qti_ims_call_conf_rollback(
+    QtiImsCall* self)
+{
+    /* Calls that ended while the merge was pending really ended */
+    qti_ims_call_conf_drop_gone(self, self->conf_pending);
+    g_hash_table_remove_all(self->conf_pending);
+
+    if (self->conf_call_id && !g_hash_table_size(self->conf_members)) {
+        BinderExtCallInfo* conf =
+            qti_ims_call_info_find(self, self->conf_call_id);
+
+        /* An isMpty call without members: let oFono see it after all */
+        DBG("conference failed, showing call %u", self->conf_call_id);
+        if (conf) {
+            conf->flags &= ~BINDER_EXT_CALL_FLAG_MPTY;
+        }
+        self->conf_call_id = 0;
+    }
+}
+
+static
+void
+qti_ims_call_conf_reset(
+    QtiImsCall* self)
+{
+    self->conf_call_id = 0;
+    g_hash_table_remove_all(self->conf_members);
+    g_hash_table_remove_all(self->conf_pending);
+    if (self->conf_check_id) {
+        g_source_remove(self->conf_check_id);
+        self->conf_check_id = 0;
+    }
+}
+
 static
 void
 qti_ims_call_set_ringback_tone(
@@ -315,8 +559,32 @@ qti_ims_call_handle_call_info(
             qti_radio_ims_call_radio_state_to_state(info->state);
 
         BinderExtCallInfo* call = qti_ims_call_info_find(self, call_id);
+        gboolean is_new = FALSE;
+
+        if (call && state != BINDER_EXT_CALL_STATE_END &&
+            qti_ims_call_conf_is_gone(self, call_id)) {
+            // The modem reuses the id of a merged call. oFono can't have
+            // two calls with the same id, so the member has to go.
+            DBG("call id %d reused, dropping the merged call", call_id);
+            qti_ims_call_conf_drop(self, call_id);
+            call = NULL;
+        }
 
         if (state == BINDER_EXT_CALL_STATE_END) {
+            if (self->conf_call_id && call_id == self->conf_call_id) {
+                DBG("conference call %d ended", call_id);
+                qti_ims_call_conf_end(self);
+                if (call && (call->flags & BINDER_EXT_CALL_FLAG_MPTY)) {
+                    // oFono never saw this one
+                    g_ptr_array_remove(self->calls, call);
+                    continue;
+                }
+            } else if (qti_ims_call_conf_is_member(self, call_id)) {
+                DBG("call %d merged into the conference", call_id);
+                qti_ims_call_conf_mark_gone(self, call_id);
+                continue;
+            }
+
           g_signal_emit(THIS(user_data), qti_ims_call_signals[SIGNAL_CALL_END],
                         0, call_id, "");
 
@@ -328,9 +596,28 @@ qti_ims_call_handle_call_info(
             // add a new call
             call = qti_ims_call_info_new(info);
             g_ptr_array_add(self->calls, call);
+            is_new = TRUE;
+            if (!info->isMT && !info->isMpty &&
+                g_hash_table_size(self->conf_pending)) {
+                // Qualcomm's own client expects isMpty in the first report
+                // of the conference call; log it if the modem differs
+                DBG("new call %d during a merge without isMpty", call_id);
+            }
+        }
+
+        if (info->isMpty && state != BINDER_EXT_CALL_STATE_END &&
+            !self->conf_call_id && qti_ims_call_conf_merging(self)) {
+            // Qualcomm's ImsServiceClassTracker.handleCalls: a new MO
+            // isMpty call during a merge is the conference
+            DBG("conference call %d%s", call_id, is_new ? " (new)" : "");
+            self->conf_call_id = call_id;
+            if (is_new) {
+                call->flags |= BINDER_EXT_CALL_FLAG_MPTY;
+            }
         }
     }
 
+    qti_ims_call_conf_sync(self);
     g_signal_emit(THIS(user_data),
                     qti_ims_call_signals[SIGNAL_CALL_STATE_CHANGED], 0);
 }
@@ -349,6 +636,7 @@ qti_ims_call_handle_voice_disabled(
          * qti_ims_call_handle_call_info would never see them leave setup */
         qti_ims_call_set_ringback_tone(self, FALSE);
     }
+    qti_ims_call_conf_reset(self);
     if (self->calls) {
         g_ptr_array_remove_range(self->calls, 0, self->calls->len);
     }
@@ -516,6 +804,7 @@ qti_ims_call_hold(
 {
     QtiImsCall* self = THIS(ext);
 
+    call_id = qti_ims_call_modem_id(self, call_id);
     DBG("Put call on hold: %u", call_id);
 
     QtiImsCallResultRequest* req = qti_ims_call_result_request_new(ext,
@@ -545,6 +834,7 @@ qti_ims_call_resume(
 {
     QtiImsCall* self = THIS(ext);
 
+    call_id = qti_ims_call_modem_id(self, call_id);
     DBG("Resume call: %u", call_id);
 
     QtiImsCallResultRequest* req = qti_ims_call_result_request_new(ext,
@@ -575,6 +865,10 @@ qti_ims_call_hangup(
     void* user_data)
 {
     QtiImsCall* self = THIS(ext);
+
+    // Hanging up a member ends the whole conference (no per-participant
+    // hangup without the participant URIs from onRefreshConferenceInfo)
+    call_id = qti_ims_call_modem_id(self, call_id);
 
     QtiImsCallResultRequest* req = qti_ims_call_result_request_new(ext,
         complete, destroy, user_data);
@@ -723,19 +1017,135 @@ qti_ims_call_swap(
                                            user_data);
 }
 
-// static
-// guint
-// qti_ims_call_conference(
-//     BinderExtCall* ext,
-//     BINDER_EXT_CALL_CONFERENCE_FLAGS flags,
-//     BinderExtCallResultFunc complete,
-//     GDestroyNotify destroy,
-//     void* user_data)
-// {
-//     // when implemented, enable in qti_ims_call_iface_init
-//     DBG("conference is not implemented yet");
-//     return 0;
-// }
+static
+void
+qti_ims_call_conference_response(
+    QtiRadioExt* radio,
+    GBinderReader* reader,
+    void* user_data)
+{
+    QtiImsCallResultRequest* req = user_data;
+    QtiImsCall* self = THIS(req->ext);
+    BinderExtCallResultFunc complete = req->complete;
+    gint32 result;
+
+    /* conferenceResponse(token, ErrorCode, SipErrorInfo), like hold */
+    if (!gbinder_reader_read_int32(reader, &result)) {
+        ofono_warn("qti_ims_call_conference_response: Failed to parse response");
+        result = -1;
+    }
+
+    DBG("conference response: %s(%d)",
+        qti_ims_call_result_response_name(result), result);
+
+    /* Update the calls before oFono builds its multiparty list */
+    if (result == QTI_RADIO_ERROR_SUCCESS) {
+        qti_ims_call_conf_commit(self);
+    } else {
+        qti_ims_call_conf_rollback(self);
+    }
+    g_signal_emit(self, qti_ims_call_signals[SIGNAL_CALL_STATE_CHANGED], 0);
+
+    if (complete) {
+        complete(req->ext,
+            (result == QTI_RADIO_ERROR_SUCCESS) ?
+                BINDER_EXT_CALL_RESULT_OK :
+                BINDER_EXT_CALL_RESULT_ERROR,
+            req->user_data);
+    }
+}
+
+static
+void
+qti_ims_call_conference_request_destroy(
+    gpointer user_data)
+{
+    QtiImsCallResultRequest* req = user_data;
+    QtiImsCall* self = THIS(req->ext);
+
+    if (g_hash_table_size(self->conf_pending)) {
+        /* Cancelled, or no response */
+        DBG("conference request dropped without a response");
+        qti_ims_call_conf_rollback(self);
+        g_signal_emit(self, qti_ims_call_signals[SIGNAL_CALL_STATE_CHANGED], 0);
+    }
+    qti_ims_call_result_request_unref(req);
+}
+
+static
+guint
+qti_ims_call_conference(
+    BinderExtCall* ext,
+    BINDER_EXT_CALL_CONFERENCE_FLAGS flags,
+    BinderExtCallResultFunc complete,
+    GDestroyNotify destroy,
+    void* user_data)
+{
+    QtiImsCall* self = THIS(ext);
+    gboolean have_active = FALSE;
+    gboolean have_held = FALSE;
+    QtiImsCallResultRequest* req;
+    guint id;
+
+    // A 0 return makes ofono-binder-plugin send the IRadio conference
+    // request instead. oFono core already refuses a second CreateMultiparty
+    // while one is pending, so this is not expected.
+    if (g_hash_table_size(self->conf_pending)) {
+        DBG("conference: a merge is already in progress");
+        return 0;
+    }
+
+    // Like Qualcomm's ImsConferenceController.sendConferenceRequest: the
+    // modem merges its ACTIVE and its HOLDING call. Members of an existing
+    // conference stand for the (hidden) conference call.
+    for (guint i = 0; i < self->calls->len; i++) {
+        BinderExtCallInfo* call = g_ptr_array_index(self->calls, i);
+
+        if (call->flags & BINDER_EXT_CALL_FLAG_MPTY) {
+            continue;
+        } else if (call->state == BINDER_EXT_CALL_STATE_ACTIVE) {
+            have_active = TRUE;
+        } else if (call->state == BINDER_EXT_CALL_STATE_HOLDING) {
+            have_held = TRUE;
+        } else {
+            continue;
+        }
+        if (!g_hash_table_contains(self->conf_members,
+            ID_KEY(call->call_id))) {
+            g_hash_table_insert(self->conf_pending, ID_KEY(call->call_id),
+                CONF_MEMBER_LIVE);
+        }
+    }
+
+    // oFono core checks for a held and an active call too, so this only
+    // happens if one of them is a CS call; then IRadio is the right path
+    if (!have_active || !have_held) {
+        DBG("conference: needs an active and a held call");
+        g_hash_table_remove_all(self->conf_pending);
+        return 0;
+    }
+
+    DBG("conference: merging %u call(s) into %s", g_hash_table_size(
+        self->conf_pending), self->conf_call_id ? "the conference" :
+        "a new conference");
+
+    // The caller's destroy belongs to us only once the request is out. On
+    // failure qti_radio_ext_result_request_submit has already called
+    // qti_ims_call_conference_request_destroy (rolled back, req freed),
+    // and a caller that gets 0 must not see its destroy called.
+    req = qti_ims_call_result_request_new(ext, complete, NULL, user_data);
+    id = qti_radio_ext_conference(self->radio_ext,
+        qti_ims_call_conference_response,
+        qti_ims_call_conference_request_destroy, req);
+
+    if (id) {
+        req->id = id;
+        req->destroy = destroy;
+        g_hash_table_insert(self->id_map, ID_KEY(id), ID_VALUE(id));
+    }
+
+    return id;
+}
 
 // static
 // guint
@@ -874,7 +1284,7 @@ qti_ims_call_iface_init(
     iface->dial = qti_ims_call_dial;
     iface->answer = qti_ims_call_answer;
     iface->swap = qti_ims_call_swap;
-    iface->conference = NULL; // not implemented - qti_ims_call_conference;
+    iface->conference = qti_ims_call_conference;
     iface->send_dtmf = NULL; // not implemented - qti_ims_call_send_dtmf;
     iface->hangup = qti_ims_call_hangup;
     iface->cancel = qti_ims_call_cancel;
@@ -927,10 +1337,15 @@ qti_ims_call_finalize(
 {
     QtiImsCall* self = THIS(object);
 
+    if (self->conf_check_id) {
+        g_source_remove(self->conf_check_id);
+    }
     qti_radio_ext_unref(self->radio_ext);
     gutil_idle_pool_destroy(self->pool);
     g_ptr_array_unref(self->calls);
     g_hash_table_unref(self->id_map);
+    g_hash_table_unref(self->conf_members);
+    g_hash_table_unref(self->conf_pending);
     G_OBJECT_CLASS(PARENT_CLASS)->finalize(object);
 }
 
@@ -941,6 +1356,8 @@ qti_ims_call_init(
 {
     self->pool = gutil_idle_pool_new();
     self->id_map = g_hash_table_new(g_direct_hash, g_direct_equal);
+    self->conf_members = g_hash_table_new(g_direct_hash, g_direct_equal);
+    self->conf_pending = g_hash_table_new(g_direct_hash, g_direct_equal);
 }
 
 static
