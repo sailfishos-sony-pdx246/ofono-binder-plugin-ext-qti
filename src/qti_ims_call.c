@@ -746,15 +746,17 @@ qti_ims_call_dial(
     QtiImsCall* self = THIS(ext);
 
     QtiImsCallResultRequest* req = qti_ims_call_result_request_new(ext,
-        complete, destroy, user_data);
+        complete, NULL, user_data);
     guint id = qti_radio_ext_dial(self->radio_ext, number, toa, clir, flags,
         qti_ims_call_result_response, qti_ims_call_result_request_destroy, req);
 
+    // On failure qti_radio_ext has already freed req through
+    // qti_ims_call_result_request_destroy. The caller's destroy belongs to
+    // us only for a non-zero id (ofono-binder-plugin refs its data only then).
     if (id) {
         req->id = id;
+        req->destroy = destroy;
         g_hash_table_insert(self->id_map, ID_KEY(id), ID_VALUE(id));
-    } else {
-        qti_ims_call_result_request_free(req);
     }
 
     DBG("Dialing return %d", id);
@@ -778,16 +780,18 @@ qti_ims_call_answer(
     QTI_RADIO_CALL_TYPE call_type = QTI_RADIO_CALL_TYPE_VOICE;
 
     QtiImsCallResultRequest* req = qti_ims_call_result_request_new(ext,
-        complete, destroy, user_data);
+        complete, NULL, user_data);
 
     guint id = qti_radio_ext_answer(self->radio_ext, call_type, presentation, mode,
         qti_ims_call_result_response, qti_ims_call_result_request_destroy, req);
 
+    // On failure qti_radio_ext has already freed req through
+    // qti_ims_call_result_request_destroy. The caller's destroy belongs to
+    // us only for a non-zero id (ofono-binder-plugin refs its data only then).
     if (id) {
         req->id = id;
+        req->destroy = destroy;
         g_hash_table_insert(self->id_map, ID_KEY(id), ID_VALUE(id));
-    } else {
-        qti_ims_call_result_request_free(req);
     }
 
     return id;
@@ -808,16 +812,18 @@ qti_ims_call_hold(
     DBG("Put call on hold: %u", call_id);
 
     QtiImsCallResultRequest* req = qti_ims_call_result_request_new(ext,
-        complete, destroy, user_data);
+        complete, NULL, user_data);
 
     guint id = qti_radio_ext_hold(self->radio_ext, call_id,
         qti_ims_call_result_response, qti_ims_call_result_request_destroy, req);
 
+    // On failure qti_radio_ext has already freed req through
+    // qti_ims_call_result_request_destroy. The caller's destroy belongs to
+    // us only for a non-zero id (ofono-binder-plugin refs its data only then).
     if (id) {
         req->id = id;
+        req->destroy = destroy;
         g_hash_table_insert(self->id_map, ID_KEY(id), ID_VALUE(id));
-    } else {
-        qti_ims_call_result_request_free(req);
     }
 
     return id;
@@ -838,16 +844,18 @@ qti_ims_call_resume(
     DBG("Resume call: %u", call_id);
 
     QtiImsCallResultRequest* req = qti_ims_call_result_request_new(ext,
-        complete, destroy, user_data);
+        complete, NULL, user_data);
 
     guint id = qti_radio_ext_resume(self->radio_ext, call_id,
         qti_ims_call_result_response, qti_ims_call_result_request_destroy, req);
 
+    // On failure qti_radio_ext has already freed req through
+    // qti_ims_call_result_request_destroy. The caller's destroy belongs to
+    // us only for a non-zero id (ofono-binder-plugin refs its data only then).
     if (id) {
         req->id = id;
+        req->destroy = destroy;
         g_hash_table_insert(self->id_map, ID_KEY(id), ID_VALUE(id));
-    } else {
-        qti_ims_call_result_request_free(req);
     }
 
     return id;
@@ -871,16 +879,18 @@ qti_ims_call_hangup(
     call_id = qti_ims_call_modem_id(self, call_id);
 
     QtiImsCallResultRequest* req = qti_ims_call_result_request_new(ext,
-        complete, destroy, user_data);
+        complete, NULL, user_data);
 
     guint id = qti_radio_ext_hangup(self->radio_ext, call_id, reason, flags,
         qti_ims_call_result_response, qti_ims_call_result_request_destroy, req);
 
+    // On failure qti_radio_ext has already freed req through
+    // qti_ims_call_result_request_destroy. The caller's destroy belongs to
+    // us only for a non-zero id (ofono-binder-plugin refs its data only then).
     if (id) {
         req->id = id;
+        req->destroy = destroy;
         g_hash_table_insert(self->id_map, ID_KEY(id), ID_VALUE(id));
-    } else {
-        qti_ims_call_result_request_free(req);
     }
 
     return id;
@@ -931,9 +941,18 @@ qti_ims_call_swap_step1_complete(
 
     req->step1_success = TRUE;
 
-    qti_ims_call_swap_step_activate(req->ext, req->answer_flags, req->call_hold,
-                                    req->call_incoming, req->complete,
-                                    req->destroy, req->user_data);
+    if (!qti_ims_call_swap_step_activate(req->ext, req->answer_flags,
+                                         req->call_hold, req->call_incoming,
+                                         req->complete, req->destroy,
+                                         req->user_data)) {
+        // Step 2 did not go out, so it does not own the caller's data:
+        // complete here and let qti_ims_call_swap_step1_destroy release it
+        DBG("Call swap step 2 could not be submitted");
+        req->step1_success = FALSE;
+        if (req->complete)
+            req->complete(req->ext, BINDER_EXT_CALL_RESULT_ERROR,
+                          req->user_data);
+    }
 }
 
 static
@@ -942,13 +961,10 @@ qti_ims_call_swap_step1_destroy(
     gpointer user_data)
 {
     QtiImsCallSwapSecondRequest *req = (QtiImsCallSwapSecondRequest *)user_data;
-    if (!req->step1_success) {
-        // mimic qti_ims_call_result_request_free as we don't proceed to step with activation
-        BinderExtCall* ext = req->ext;
-        if (req->destroy) 
-            req->destroy(req->user_data);
-        binder_ext_call_unref(ext);
-    }
+    // Step 2 was not submitted, so the caller's destroy is ours. req->ext
+    // holds no reference (the step 1 request has its own), so no unref here.
+    if (!req->step1_success && req->destroy)
+        req->destroy(req->user_data);
     g_free(user_data);
 }
 
@@ -963,6 +979,8 @@ qti_ims_call_swap(
     void* user_data)
 {
     QtiImsCall* self = THIS(ext);
+    QtiImsCallSwapSecondRequest *rdata = NULL;
+    guint id;
 
     DBG("Call swap: swap_flags=%u answer_flags=%u", swap_flags, answer_flags);
 
@@ -984,8 +1002,7 @@ qti_ims_call_swap(
 
     if (full_swap) {
         // prepare for two step operation
-        QtiImsCallSwapSecondRequest *rdata =
-            g_new0(QtiImsCallSwapSecondRequest, 1);
+        rdata = g_new0(QtiImsCallSwapSecondRequest, 1);
 
         rdata->step1_success = FALSE;
         rdata->answer_flags = answer_flags;
@@ -1004,17 +1021,23 @@ qti_ims_call_swap(
 
     // deal with active call first
     if (swap_flags == BINDER_EXT_CALL_SWAP_FLAG_HANGUP && call_active) {
-        return qti_ims_call_hangup(
+        id = qti_ims_call_hangup(
             ext, call_active, BINDER_EXT_CALL_HANGUP_TERMINATE,
             BINDER_EXT_CALL_HANGUP_NO_FLAGS, complete, destroy, user_data);
     } else if (call_active) {
-        return qti_ims_call_hold(ext, call_active, complete, destroy, user_data);
+        id = qti_ims_call_hold(ext, call_active, complete, destroy, user_data);
+    } else {
+        // this is called only if there are no active calls
+        id = qti_ims_call_swap_step_activate(ext, answer_flags, call_hold,
+                                             call_incoming, complete, destroy,
+                                             user_data);
     }
 
-    // this is called only if there are no active calls
-    return qti_ims_call_swap_step_activate(ext, answer_flags, call_hold,
-                                           call_incoming, complete, destroy,
-                                           user_data);
+    if (!id && rdata) {
+        // step 1 did not go out, nobody will call step1_destroy
+        g_free(rdata);
+    }
+    return id;
 }
 
 static
