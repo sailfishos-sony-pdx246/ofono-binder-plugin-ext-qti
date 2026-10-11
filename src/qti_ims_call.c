@@ -66,6 +66,7 @@ typedef struct qti_ims_call {
     guint member_hangup_idle;   /* idle source */
     GHashTable* hangup_records; /* id -> QtiImsCallMemberHangup*, sent */
     guint last_hangup_id;
+    gboolean remove_participants; /* else a member hangup ends it all */
 } QtiImsCall;
 
 /*
@@ -1375,10 +1376,14 @@ qti_ims_call_member_hangup_idle(
         g_hash_table_add(asked, ID_KEY(hangup->call_id));
     }
 
-    // oFono's release_all_active/held asks for every member at once
-    g_hash_table_iter_init(&it, self->conf_members);
-    while (all && g_hash_table_iter_next(&it, &key, NULL)) {
-        all = g_hash_table_contains(asked, key);
+    // Unless set up to remove single participants, any member hangup ends
+    // the conference. oFono's release_all_active/held asks for every member
+    // at once, which ends it in either case.
+    if (self->remove_participants) {
+        g_hash_table_iter_init(&it, self->conf_members);
+        while (all && g_hash_table_iter_next(&it, &key, NULL)) {
+            all = g_hash_table_contains(asked, key);
+        }
     }
 
     // Removing a participant needs its URI
@@ -1472,8 +1477,10 @@ qti_ims_call_hangup(
         flags = BINDER_EXT_CALL_HANGUP_NO_FLAGS;
     }
 
-    // A member of a conference with others left: remove that participant,
-    // unless oFono hangs up all members (see qti_ims_call_member_hangup_idle)
+    // A member of a conference with others left: end the conference, or
+    // remove only that participant (remove_participants); either way, wait
+    // for the other members oFono may hang up in the same go (see
+    // qti_ims_call_member_hangup_idle)
     if (self->conf_call_id &&
         g_hash_table_contains(self->conf_members, ID_KEY(call_id)) &&
         g_hash_table_size(self->conf_members) > 1) {
@@ -1980,6 +1987,18 @@ qti_ims_call_new(
         return BINDER_EXT_CALL(self);
     }
     return NULL;
+}
+
+void
+qti_ims_call_set_remove_participants(
+    BinderExtCall* ext,
+    gboolean remove)
+{
+    if (G_LIKELY(ext)) {
+        THIS(ext)->remove_participants = remove;
+        DBG("conference: hanging up a member %s", remove ?
+            "removes that participant" : "ends the conference");
+    }
 }
 
 /*==========================================================================*

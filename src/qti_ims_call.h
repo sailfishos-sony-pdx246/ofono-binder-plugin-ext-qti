@@ -26,6 +26,17 @@ qti_ims_call_new(
     QtiRadioExt* ims_radio)
     G_GNUC_INTERNAL;
 
+/*
+ * What hanging up one member of a conference does: end the conference
+ * (FALSE, the default: Sailfish's call screen hangs up a single call for
+ * "End call"), or remove only that participant (TRUE)
+ */
+void
+qti_ims_call_set_remove_participants(
+    BinderExtCall* ext,
+    gboolean remove)
+    G_GNUC_INTERNAL;
+
 #endif /* QTI_IMS_CALL_H */
 
 /*

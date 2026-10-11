@@ -45,6 +45,7 @@
 #include <binder_ext_slot_impl.h>
 
 #include <radio_instance.h>
+#include <ofono/log.h>
 #include <gutil_macros.h>
 #include <gutil_log.h>
 
@@ -129,9 +130,20 @@ qti_slot_new(
 
     self->radio_ext = qti_radio_ext_new(dev, radio_slot);
     if (self->radio_ext) {
+        /* extPlugin = qti:memberHangup=participant (see qti.conf) */
+        const char* member_hangup = params ?
+            g_hash_table_lookup(params, "memberHangup") : NULL;
+
         self->ims = qti_ims_new(radio_slot, self->radio_ext);
         self->call = qti_ims_call_new(self->radio_ext);
         self->sms = qti_ims_sms_new(self->radio_ext);
+        if (member_hangup && g_strcmp0(member_hangup, "participant") &&
+            g_strcmp0(member_hangup, "conference")) {
+            ofono_warn("qti: unknown memberHangup value '%s', using "
+                "'conference'", member_hangup);
+        }
+        qti_ims_call_set_remove_participants(self->call,
+            !g_strcmp0(member_hangup, "participant"));
     } else {
         DBG("slot->radio_ext is null ");
     }
