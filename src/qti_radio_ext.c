@@ -98,6 +98,7 @@ enum qti_radio_ext_signal {
     SIGNAL_EXT_ON_VOICE_DISABLED,
     SIGNAL_EXT_HANDOVER,
     SIGNAL_EXT_ON_RINGBACK_TONE,
+    SIGNAL_EXT_ON_CONF_INFO,
     SIGNAL_COUNT
 };
 
@@ -109,6 +110,7 @@ enum qti_radio_ext_signal {
 #define SIGNAL_EXT_ON_VOICE_DISABLED_NAME           "qti-radio-ext-on-voice-disabled"
 #define SIGNAL_EXT_HANDOVER_NAME                    "qti-radio-ext-handover"
 #define SIGNAL_EXT_ON_RINGBACK_TONE_NAME            "qti-radio-ext-on-ringback-tone"
+#define SIGNAL_EXT_ON_CONF_INFO_NAME                "qti-radio-ext-on-conf-info"
 
 static guint qti_radio_ext_signals[SIGNAL_COUNT] = { 0 };
 
@@ -866,6 +868,43 @@ qti_radio_ext_handle_ringback_tone_indication(
 
 static
 void
+qti_radio_ext_handle_conf_info_indication(
+    QtiRadioExt* self,
+    const GBinderReader* args)
+{
+    /*
+     * oneway onRefreshConferenceInfo(in ConferenceInfo conferenceInfo),
+     * parcelable ConferenceInfo { byte[] confInfoUri;
+     * ConferenceCallState conferenceCallState; } (ims.apk). confInfoUri
+     * is the conference-info document of the network's NOTIFY.
+     */
+    GBinderReader reader;
+    const void* xml = NULL;
+    gsize len = 0;
+    gint32 state = 0;
+
+    gbinder_reader_copy(&reader, args);
+    if (!qti_binder_read_parcelable_size(&reader)) {
+        DBG("%s: failed to parse conference info", self->slot);
+        return;
+    }
+    xml = gbinder_reader_read_byte_array(&reader, &len);
+    if (!xml) {
+        len = 0;
+    }
+    if (!gbinder_reader_read_int32(&reader, &state)) {
+        DBG("%s: failed to parse conference info", self->slot);
+        return;
+    }
+
+    DBG("%s: conference info: %u bytes, conference call state %d",
+        self->slot, (guint)len, state);
+    g_signal_emit(self, qti_radio_ext_signals[SIGNAL_EXT_ON_CONF_INFO], 0,
+        xml, (guint)len, state);
+}
+
+static
+void
 qti_radio_ext_handle_vops_indication(
     QtiRadioExt* self,
     const GBinderReader* args)
@@ -1044,6 +1083,9 @@ qti_radio_ext_indication(
         case QTI_RADIO_IND_RINGBACK_TONE_INDICATION:
             qti_radio_ext_handle_ringback_tone_indication(self, &args);
             return NULL;
+        case QTI_RADIO_IND_REFRESH_CONF_INFO_INDICATION:
+            qti_radio_ext_handle_conf_info_indication(self, &args);
+            return NULL;
         case QTI_RADIO_IND_REG_STATE_INDICATION:
             qti_radio_ext_handle_ims_reg_status_report(self, &args);
             return NULL;
@@ -1118,6 +1160,16 @@ qti_radio_ext_add_ringback_tone_handler(
 {
     return (G_LIKELY(self) && G_LIKELY(handler)) ? g_signal_connect(self,
         SIGNAL_EXT_ON_RINGBACK_TONE_NAME, G_CALLBACK(handler), user_data) : 0;
+}
+
+gulong
+qti_radio_ext_add_conf_info_handler(
+    QtiRadioExt* self,
+    QtiRadioExtConfInfoFunc handler,
+    void* user_data)
+{
+    return (G_LIKELY(self) && G_LIKELY(handler)) ? g_signal_connect(self,
+        SIGNAL_EXT_ON_CONF_INFO_NAME, G_CALLBACK(handler), user_data) : 0;
 }
 
 gulong
@@ -1750,25 +1802,16 @@ qti_radio_ext_answer(
 
 static
 void
-qti_radio_ext_hangup_args(
+qti_radio_ext_write_hangup_request(
     GBinderWriter* writer,
-    va_list va)
+    gint32 conn_index,
+    gboolean multiparty,
+    const char* conn_uri,
+    gint32 fail_cause)
 {
-    guint call_id = va_arg(va, guint);
-    BINDER_EXT_CALL_HANGUP_REASON reason = va_arg(va, BINDER_EXT_CALL_HANGUP_REASON);
-    BINDER_EXT_CALL_HANGUP_FLAGS flags = va_arg(va, BINDER_EXT_CALL_HANGUP_FLAGS);
-
     gint32 initial_size;
     gint32 initial_size_failCause;
     gint32 initial_size_sipErrorInfo;
-
-    gint32 failCauseReason; // Normal call end BINDER_EXT_CALL_HANGUP_TERMINATE
-    if (reason == BINDER_EXT_CALL_HANGUP_IGNORE)
-        failCauseReason = QTI_RADIO_CALL_FAIL_CAUSE_NORMAL_UNSPECIFIED;
-    else if (reason == BINDER_EXT_CALL_HANGUP_REJECT)
-        failCauseReason = QTI_RADIO_CALL_FAIL_CAUSE_USER_REJECT;
-    else // BINDER_EXT_CALL_HANGUP_TERMINATE
-      failCauseReason = QTI_RADIO_CALL_FAIL_CAUSE_NORMAL;
 
     /* Non-null parcelable */
     gbinder_writer_append_int32(writer, 1);
@@ -1776,9 +1819,9 @@ qti_radio_ext_hangup_args(
     /* Dummy parcelable size, replaced at the end */
     gbinder_writer_append_int32(writer, 0);
 
-    gbinder_writer_append_int32(writer, call_id);
-    gbinder_writer_append_bool(writer, FALSE);     // multiparty
-    gbinder_writer_append_string16(writer, "");    //connUri
+    gbinder_writer_append_int32(writer, conn_index);
+    gbinder_writer_append_bool(writer, multiparty);
+    gbinder_writer_append_string16(writer, conn_uri);
     gbinder_writer_append_int32(writer, G_MAXINT); // conf_id
 
     // parcelable for failCauseResponse
@@ -1787,7 +1830,7 @@ qti_radio_ext_hangup_args(
     /* Dummy parcelable size, replaced at the end */
     gbinder_writer_append_int32(writer, 0);
 
-    gbinder_writer_append_int32(writer, failCauseReason);
+    gbinder_writer_append_int32(writer, fail_cause);
     gbinder_writer_append_int32(writer, 0); // errorInfo byte array set to empty one (0 bytes)
     gbinder_writer_append_string16(writer, ""); // networkErrorString
     gbinder_writer_append_bool(writer, FALSE); // hasErrorDetails
@@ -1811,6 +1854,63 @@ qti_radio_ext_hangup_args(
     /* Overwrite parcelable size */
     gbinder_writer_overwrite_int32(writer, initial_size,
         gbinder_writer_bytes_written(writer) - initial_size);
+}
+
+static
+void
+qti_radio_ext_hangup_args(
+    GBinderWriter* writer,
+    va_list va)
+{
+    guint call_id = va_arg(va, guint);
+    BINDER_EXT_CALL_HANGUP_REASON reason = va_arg(va, BINDER_EXT_CALL_HANGUP_REASON);
+    BINDER_EXT_CALL_HANGUP_FLAGS flags = va_arg(va, BINDER_EXT_CALL_HANGUP_FLAGS);
+
+    gint32 failCauseReason; // Normal call end BINDER_EXT_CALL_HANGUP_TERMINATE
+    if (reason == BINDER_EXT_CALL_HANGUP_IGNORE)
+        failCauseReason = QTI_RADIO_CALL_FAIL_CAUSE_NORMAL_UNSPECIFIED;
+    else if (reason == BINDER_EXT_CALL_HANGUP_REJECT)
+        failCauseReason = QTI_RADIO_CALL_FAIL_CAUSE_USER_REJECT;
+    else // BINDER_EXT_CALL_HANGUP_TERMINATE
+      failCauseReason = QTI_RADIO_CALL_FAIL_CAUSE_NORMAL;
+
+    (void)flags;
+    qti_radio_ext_write_hangup_request(writer, call_id, FALSE, "",
+        failCauseReason);
+}
+
+static
+void
+qti_radio_ext_remove_participant_args(
+    GBinderWriter* writer,
+    va_list va)
+{
+    const char* uri = va_arg(va, const char*);
+
+    /*
+     * Like ims.apk's ImsCallSessionImpl.removeParticipants ->
+     * hangupWithReason(0, uri, null, true, CODE_USER_TERMINATED) ->
+     * StableAidl.fromHangup: no connection index (INT_MAX), multiParty
+     * set, the participant's URI, fail cause 501.
+     */
+    qti_radio_ext_write_hangup_request(writer, G_MAXINT, TRUE, uri,
+        QTI_RADIO_CALL_FAIL_CAUSE_USER_BUSY);
+}
+
+guint
+qti_radio_ext_remove_participant(
+    QtiRadioExt* self,
+    const char* uri,
+    QtiRadioExtResultFunc complete,
+    GDestroyNotify destroy,
+    void* user_data)
+{
+    return qti_radio_ext_result_request_submit(self,
+        QTI_RADIO_REQ_HANGUP,
+        QTI_RADIO_RESP_HANGUP,
+        qti_radio_ext_remove_participant_args,
+        complete, destroy, user_data,
+        uri);
 }
 
 guint
@@ -2136,6 +2236,10 @@ qti_radio_ext_class_init(
         g_signal_new(SIGNAL_EXT_ON_RINGBACK_TONE_NAME, G_OBJECT_CLASS_TYPE(klass),
             G_SIGNAL_RUN_FIRST, 0, NULL, NULL, NULL, G_TYPE_NONE,
             1, G_TYPE_BOOLEAN);
+    qti_radio_ext_signals[SIGNAL_EXT_ON_CONF_INFO] =
+        g_signal_new(SIGNAL_EXT_ON_CONF_INFO_NAME, G_OBJECT_CLASS_TYPE(klass),
+            G_SIGNAL_RUN_FIRST, 0, NULL, NULL, NULL, G_TYPE_NONE,
+            3, G_TYPE_POINTER, G_TYPE_UINT, G_TYPE_INT);
 }
 
 /*

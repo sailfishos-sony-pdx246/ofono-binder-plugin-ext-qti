@@ -69,6 +69,14 @@ typedef void (*QtiRadioExtVoiceDisabledFunc)(
     QtiRadioExt* radio,
     void* user_data);
 
+/* xml: the conference-info document (RFC 4575), not NUL-terminated */
+typedef void (*QtiRadioExtConfInfoFunc)(
+    QtiRadioExt* radio,
+    const void* xml,
+    guint len,
+    gint32 conf_call_state,
+    void* user_data);
+
 typedef void (*QtiRadioExtHandoverFunc)(
     QtiRadioExt* radio,
     QTI_RADIO_HANDOVER_TYPE type,
@@ -164,6 +172,15 @@ qti_radio_ext_conference(
     GDestroyNotify destroy,
     void* user_data);
 
+/* Removes one participant from the IMS conference (hangup by URI) */
+guint
+qti_radio_ext_remove_participant(
+    QtiRadioExt* self,
+    const char* uri,
+    QtiRadioExtResultFunc complete,
+    GDestroyNotify destroy,
+    void* user_data);
+
 guint
 qti_radio_ext_send_ims_sms(
     QtiRadioExt* self,
@@ -247,6 +264,12 @@ gulong
 qti_radio_ext_add_handover_handler(
     QtiRadioExt* self,
     QtiRadioExtHandoverFunc handler,
+    void* user_data);
+
+gulong
+qti_radio_ext_add_conf_info_handler(
+    QtiRadioExt* self,
+    QtiRadioExtConfInfoFunc handler,
     void* user_data);
 
 #endif /* QTI_RADIO_EXT_H */
